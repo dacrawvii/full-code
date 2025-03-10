@@ -1,0 +1,347 @@
+import os
+import pandas as pd
+import requests
+import json
+import time
+import asyncio
+from datetime import datetime
+from azure.storage.blob import BlobServiceClient
+from shapely.geometry import Point, mapping
+from loguru import logger
+import backoff
+from pydantic import BaseSettings
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
+
+# Configuration Management with pydantic
+class Settings(BaseSettings):
+    azure_storage_account: str
+    azure_input_container: str
+    azure_output_container: str
+    azure_log_container: str
+    azure_archive_container: str
+    azure_maps_key: str
+    teams_webhook_url: str
+    notification_url: str
+    batch_size: int = 500
+    log_retention_days: int = 365
+
+    class Config:
+        env_file = ".env"
+
+CONFIG = Settings()
+
+# Configure loguru for logging
+logger.add("logs/notifications.log", rotation="1 week", retention="365 days", level="INFO")
+
+# Function to Send Microsoft Teams Messages
+@backoff.on_exception(backoff.expo, requests.exceptions.RequestException, max_tries=5)
+def send_teams_message(message):
+    payload = {"text": message}
+    headers = {"Content-Type": "application/json"}
+    response = requests.post(CONFIG.teams_webhook_url, json=payload, headers=headers)
+    response.raise_for_status()
+    logger.info("Teams Notification Sent - {}", message)
+
+# Function to Load Data from Azure Blob Storage
+def load_data_from_blob(blob_name):
+    try:
+        blob_service_client = BlobServiceClient(account_url=f"https://{CONFIG.azure_storage_account}.blob.core.windows.net", credential=None)
+        blob_client = blob_service_client.get_blob_client(container=CONFIG.azure_input_container, blob=blob_name)
+
+        local_file = os.path.join("processed", blob_name)
+       
+        with open(local_file, "wb") as file:
+            file.write(blob_client.download_blob().readall())
+
+        send_teams_message(f"📂 Data Loaded from Azure: {blob_name}")
+        return local_file
+    except Exception as e:
+        logger.error("Failed to load data from blob: {}", e)
+        raise
+
+# Function to Validate Data
+def validate_data(df):
+    required_columns = ["region", "country", "education_institution", "field_of_study", "profession", "address"]
+    for col in required_columns:
+        if col not in df.columns:
+            raise ValueError(f"Missing required column: {col}")
+    return df
+
+# Function to Clean and Sort Data with Enhanced Error Handling
+def clean_and_sort_data(df):
+    invalid_data = pd.DataFrame()
+    missing_values = pd.DataFrame()
+    invalid_data_types = pd.DataFrame()
+    duplicates = pd.DataFrame()
+
+    # Remove duplicates
+    duplicates = df[df.duplicated()]
+    df.drop_duplicates(inplace=True)
+
+    # Fill missing values and segregate invalid data
+    for col in ["region", "country", "education_institution", "address"]:
+        invalid_rows = df[df[col].isna()]
+        if not invalid_rows.empty:
+            missing_values = pd.concat([missing_values, invalid_rows])
+            df = df.drop(invalid_rows.index)
+
+    # Handle invalid data types
+    for col in ["region", "country", "education_institution", "field_of_study", "profession", "address"]:
+        invalid_rows = df[~df[col].apply(lambda x: isinstance(x, str))]
+        if not invalid_rows.empty:
+            invalid_data_types = pd.concat([invalid_data_types, invalid_rows])
+            df = df.drop(invalid_rows.index)
+
+    # Sort data by region and country
+    df.sort_values(by=["region", "country"], inplace=True)
+
+    # Save invalid data to separate CSV files
+    if not missing_values.empty:
+        missing_values.to_csv("missing_values.csv", index=False)
+        logger.error("Missing values found and stored in missing_values.csv")
+
+    if not invalid_data_types.empty:
+        invalid_data_types.to_csv("invalid_data_types.csv", index=False)
+        logger.error("Invalid data types found and stored in invalid_data_types.csv")
+
+    if not duplicates.empty:
+        duplicates.to_csv("duplicates.csv", index=False)
+        logger.error("Duplicates found and stored in duplicates.csv")
+
+    return df
+
+# Function to Process Data & Extract Features
+def process_data(file_path):
+    try:
+        df = pd.read_excel(file_path) if file_path.endswith(".xlsx") else pd.read_csv(file_path)
+        df = validate_data(df)
+        df = clean_and_sort_data(df)
+
+        df = df[["region", "country", "education_institution", "field_of_study", "profession", "address"]]
+        df.dropna(subset=["address"], inplace=True)
+        df["date"] = datetime.today().strftime('%Y-%m-%d')
+        df["year"] = datetime.today().year
+
+        send_teams_message(f"✅ Data Processing Completed: {file_path}")
+
+        return df
+    except Exception as e:
+        logger.error("Failed to process data: {}", e)
+        raise
+
+# Optimized Function to Perform Batch Geocoding using Azure Maps API
+async def batch_geocode(df, batch_size=500):
+    results = []
+    non_education_addresses = pd.DataFrame()
+    education_keywords = ["university", "college", "institute", "school", "academy"]
+
+    async with aiohttp.ClientSession() as session:
+        for i in range(0, len(df), batch_size):
+            batch = df.iloc[i:i+batch_size]
+            payload = {"batchItems": [{"query": row["address"]} for _, row in batch.iterrows()]}
+            url = f"https://atlas.microsoft.com/geocode/batch/json?subscription-key={CONFIG.azure_maps_key}&api-version=1.0"
+            
+            async with session.post(url, json=payload) as response:
+                if response.status == 200:
+                    json_response = await response.json()
+                    for j, item in enumerate(json_response.get("batchItems", [])):
+                        if "lat" in item and "lon" in item:
+                            address = item["address"]
+                            if any(keyword in address.lower() for keyword in education_keywords):
+                                batch.iloc[j, batch.columns.get_loc("latitude")] = item["lat"]
+                                batch.iloc[j, batch.columns.get_loc("longitude")] = item["lon"]
+                                results.append(batch.iloc[j])
+                            else:
+                                non_education_addresses = pd.concat([non_education_addresses, batch.iloc[[j]]])
+                else:
+                    error_message = f"Geocoding API Error {response.status}: {await response.text()}"
+                    logger.error(error_message)
+                    send_teams_message(f"⚠️ {error_message}")
+
+            await asyncio.sleep(1)  # Rate limit compliance
+
+            # Send Teams message for each batch
+            send_teams_message(f"✅ Batch {i//batch_size + 1} Completed: {len(batch)} rows processed, {len(non_education_addresses)} non-education addresses found")
+
+    if not non_education_addresses.empty:
+        non_education_addresses.sort_values(by=["region", "country"], inplace=True)
+        non_education_addresses.fillna("Unknown", inplace=True)
+        non_education_addresses.to_csv("non_education_addresses.csv", index=False)
+        logger.error("Non-education addresses found and stored in non_education_addresses.csv")
+    
+    send_teams_message(f"✅ Geocoding Completed for {len(results)} addresses")
+    return pd.DataFrame(results)
+
+# Function to Convert Data to GeoJSON with Metadata
+def generate_geojson(df):
+    try:
+        geojson = {
+            "type": "FeatureCollection",
+            "features": []
+        }
+
+        for _, row in df.iterrows():
+            feature = {
+                "type": "Feature",
+                "geometry": mapping(Point(row["longitude"], row["latitude"])),
+                "properties": {
+                    "region": row["region"],
+                    "country": row["country"],
+                    "education_institution": row["education_institution"],
+                    "field_of_study": row["field_of_study"],
+                    "profession": row["profession"],
+                    "date": row["date"],
+                    "year": row["year"]
+                }
+            }
+            geojson["features"].append(feature)
+
+        geojson_path = os.path.join("processed", "processed_data.geojson")
+        with open(geojson_path, "w") as f:
+            json.dump(geojson, f)
+
+        send_teams_message(f"📍 GeoJSON Created: {geojson_path}")
+        return geojson_path
+    except Exception as e:
+        logger.error("Failed to generate GeoJSON: {}", e)
+        raise
+
+# Function to Upload Processed Data to Azure
+def upload_to_blob(file_path, blob_name):
+    try:
+        blob_service_client = BlobServiceClient(account_url=f"https://{CONFIG.azure_storage_account}.blob.core.windows.net", credential=None)
+        blob_client = blob_service_client.get_blob_client(container=CONFIG.azure_output_container, blob=blob_name)
+
+        with open(file_path, "rb") as file_data:
+            blob_client.upload_blob(file_data, overwrite=True)
+
+        send_teams_message(f"✅ Processed Data Uploaded: {blob_name}")
+         except Exception as e:
+             logger.error("Failed to upload {}: {}", blob_name, e)
+             send_teams_message("❌ Failed to upload: {blob_name}")
+
+     # Main Workflow Execution
+     if __name__ == "__main__":
+         send_teams_message("✅ Data Processing System Initialized.")
+
+         try:
+             input_file = "education_data.xlsx"
+             local_path = load_data_from_blob(input_file)
+             df = process_data(local_path)
+             df = asyncio.run(batch_geocode(df, batch_size=CONFIG.batch_size))
+             geojson_file = generate_geojson(df)
+             upload_to_blob(geojson_file, "processed_data.geojson")
+             send_teams_message("🚀 Data Processing Completed Successfully.")
+         except Exception as e:
+             logger.error("An error occurred during the workflow execution: {}", e)
+             send_teams_message("❌ Data Processing Failed.")
+
+     # Test Cases
+     import pytest
+     from unittest.mock import patch, MagicMock
+
+     # Test for send_teams_message
+     @patch('geoapify_qgis_parser.requests.post')
+     def test_send_teams_message(mock_post):
+         mock_post.return_value.status_code = 200
+         send_teams_message("Test message")
+         mock_post.assert_called_once()
+
+     # Test for load_data_from_blob
+     @patch('geoapify_qgis_parser.BlobServiceClient')
+     def test_load_data_from_blob(mock_blob_service_client):
+         mock_blob_client = MagicMock()
+         mock_blob_service_client.return_value.get_blob_client.return_value = mock_blob_client
+         mock_blob_client.download_blob.return_value.readall.return_value = b"test data"
+         local_file = load_data_from_blob("test_blob")
+         assert os.path.exists(local_file)
+
+     # Test for validate_data
+     def test_validate_data():
+         df = pd.DataFrame({
+             "region": ["Region1"],
+             "country": ["Country1"],
+             "education_institution": ["Institution1"],
+             "field_of_study": ["Field1"],
+             "profession": ["Profession1"],
+             "address": ["Address1"]
+         })
+         validated_df = validate_data(df)
+         assert not validated_df.empty
+
+         # Test for missing required columns
+         df_missing_columns = pd.DataFrame({
+             "region": ["Region1"],
+             "country": ["Country1"]
+         })
+         with pytest.raises(ValueError):
+             validate_data(df_missing_columns)
+
+     # Test for clean_and_sort_data
+     def test_clean_and_sort_data():
+         df = pd.DataFrame({
+             "region": ["Region1", "Region1"],
+             "country": ["Country1", "Country1"],
+             "education_institution": ["Institution1", "Institution1"],
+             "field_of_study": ["Field1", "Field1"],
+             "profession": ["Profession1", "Profession1"],
+             "address": ["Address1", None]
+         })
+         cleaned_df = clean_and_sort_data(df)
+         assert "region" in cleaned_df.columns
+         assert "country" in cleaned_df.columns
+         assert cleaned_df.isna().sum().sum() == 0
+
+     # Test for process_data
+     def test_process_data():
+         file_path = "test_data.xlsx"
+         df = process_data(file_path)
+         assert "date" in df.columns
+         assert "year" in df.columns
+
+     # Test for batch_geocode
+     @patch('geoapify_qgis_parser.aiohttp.ClientSession.post')
+     async def test_batch_geocode(mock_post):
+         mock_response = MagicMock()
+         mock_response.status = 200
+         mock_response.json.return_value = {
+             "batchItems": [
+                 {"lat": 10.0, "lon": 20.0, "address": "University Address"}
+             ]
+         }
+         mock_post.return_value.__aenter__.return_value = mock_response
+
+         df = pd.DataFrame({
+             "address": ["University Address"]
+         })
+         geocoded_df = await batch_geocode(df)
+         assert "latitude" in geocoded_df.columns
+         assert "longitude" in geocoded_df.columns
+
+     # Test for generate_geojson
+     def test_generate_geojson():
+         df = pd.DataFrame({
+             "region": ["Region1"],
+             "country": ["Country1"],
+             "education_institution": ["Institution1"],
+             "field_of_study": ["Field1"],
+             "profession": ["Profession1"],
+             "address": ["Address1"],
+             "latitude": [10.0],
+             "longitude": [20.0],
+             "date": ["2025-03-04"],
+             "year": [2025]
+         })
+         geojson_path = generate_geojson(df)
+         assert geojson_path.endswith(".geojson")
+
+     # Test for upload_to_blob
+     @patch('geoapify_qgis_parser.BlobServiceClient')
+     def test_upload_to_blob(mock_blob_service_client):
+         mock_blob_client = MagicMock()
+         mock_blob_service_client.return_value.get_blob_client.return_value = mock_blob_client
+         upload_to_blob("test_geojson.geojson", "processed_data.geojson")
+         mock_blob_client.upload_blob.assert_called_once()
